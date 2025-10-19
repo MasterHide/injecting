@@ -154,6 +154,8 @@ menu_update_config() {
   local bot chat
   if ! read -r bot chat < <(prompt_token_chatid); then return 1; fi
   create_backup
+  # Remove old doc-comment lines about "additional parameters"
+  safe_sudo sed -i '/^# For additional parameters/d;/^# Для дополнительных параметров/d' "$CONFIG"
   build_snippet "$bot" "$chat"
   merge_snippet
   validate_merged || { cp -a "$BACKUP_PATH" "$CONFIG"; return 1; }
