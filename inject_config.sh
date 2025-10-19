@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# inject_config.sh -- production-ready interactive tool for /opt/tblocker/config.yaml
-# Features:
-#  - update BypassIPS + StorageDir + webhook (token/chat) safely (backup)
-#  - optional service restart
-#  - manual restart & manual edit option
-#  - log viewing (tail + journalctl)
-#  - can install itself as global command 'tblock'
+# inject_config.sh -- interactive helper for /opt/tblocker/config.yaml
 #
-# Requires: yq (mikefarah/yq v4+)
-# Usage: run as normal user; script will use sudo when root is required.
+# Features:
+#  - Installs required packages (yq, nano, curl, wget, systemd utils) if missing
+#  - Ensures config and directories exist
+#  - Update BypassIPS + StorageDir + webhook (token/chat) safely (with backup)
+#  - Manual restart / manual edit options
+#  - Log viewing (tail + journalctl)
+#  - Can install itself globally as "tblock"
+
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -18,51 +18,53 @@ BACKUP_DIR="/opt/tblocker/backups"
 TMPROOT="$(mktemp -d -t injectcfg.XXXXXX)"
 SNIPPET="$TMPROOT/snippet.yaml"
 MERGED="$TMPROOT/merged.yaml"
-INSTALL_PATH="/usr/local/bin/tblock"   # global command symlink / file
+INSTALL_PATH="/usr/local/bin/tblock"
 SERVICE_NAME="tblocker"
 ACCESS_LOG="/usr/local/x-ui/access.log"
 ########## End configuration ##########
 
-cleanup() {
-  rm -rf "$TMPROOT"
-}
+cleanup() { rm -rf "$TMPROOT"; }
 trap cleanup EXIT
 
-log() { printf '%s\n' "$*"; }
-err() { printf 'ERROR: %s\n' "$*" >&2; }
+log() { printf '[INFO] %s\n' "$*"; }
+err() { printf '[ERROR] %s\n' "$*" >&2; }
 
-require_yq() {
-  if ! command -v yq >/dev/null 2>&1; then
-    err "'yq' (mikefarah/yq v4+) is required but not found."
-    cat <<'USAGE' >&2
+is_root() { [[ "$(id -u)" -eq 0 ]]; }
+safe_sudo() { if is_root; then "$@"; else sudo "$@"; fi; }
 
-Install example (Linux x86_64):
-  sudo wget -O /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-  sudo chmod +x /usr/local/bin/yq
+# ---------- Dependency check ----------
+install_requirements() {
+  log "Checking and installing required packages..."
+  if ! command -v curl >/dev/null 2>&1; then safe_sudo apt-get update -y && safe_sudo apt-get install -y curl; fi
+  if ! command -v wget >/dev/null 2>&1; then safe_sudo apt-get install -y wget; fi
+  if ! command -v nano >/dev/null 2>&1; then safe_sudo apt-get install -y nano; fi
+  if ! command -v systemctl >/dev/null 2>&1; then safe_sudo apt-get install -y systemd; fi
 
-Or install from your package manager.
-USAGE
-    return 1
+  if ! command -v /usr/local/bin/yq >/dev/null 2>&1; then
+    log "Installing yq (mikefarah v4)..."
+    ARCH=$(uname -m)
+    case "$ARCH" in
+      x86_64) BIN="yq_linux_amd64" ;;
+      aarch64) BIN="yq_linux_arm64" ;;
+      armv7l) BIN="yq_linux_arm" ;;
+      *) BIN="yq_linux_amd64"; log "Unknown arch $ARCH, defaulting to amd64";;
+    esac
+    safe_sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/${BIN}"
+    safe_sudo chmod +x /usr/local/bin/yq
   fi
+
+  log "Dependencies ready."
 }
 
-ensure_config_exists() {
+require_config() {
+  if [[ ! -d "$(dirname "$CONFIG")" ]]; then
+    log "Creating config directory $(dirname "$CONFIG")..."
+    safe_sudo mkdir -p "$(dirname "$CONFIG")"
+  fi
   if [[ ! -f "$CONFIG" ]]; then
-    err "Config file not found at $CONFIG"
-    return 1
-  fi
-}
-
-is_root() {
-  [[ "$(id -u)" -eq 0 ]]
-}
-
-safe_sudo() {
-  # run command with sudo if not root
-  if is_root; then
-    "$@"
-  else
-    sudo "$@"
+    log "Config file not found, creating empty $CONFIG..."
+    safe_sudo touch "$CONFIG"
+    safe_sudo chmod 644 "$CONFIG"
   fi
 }
 
@@ -78,11 +80,9 @@ build_snippet() {
   local bot_token="$1"
   local chat_id="$2"
   cat > "$SNIPPET" <<EOF
-# IP addresses to bypass blocking (never blocked)
 BypassIPS:
   - "127.0.0.1"
   - "::1"
-  # Cloudflare IPv4 ranges
   - "103.21.244.0/22"
   - "103.22.200.0/22"
   - "103.31.4.0/22"
@@ -98,7 +98,6 @@ BypassIPS:
   - "190.93.240.0/20"
   - "197.234.240.0/22"
   - "198.41.128.0/17"
-  # Cloudflare IPv6 ranges
   - "2400:cb00::/32"
   - "2606:4700::/32"
   - "2803:f800::/32"
@@ -106,11 +105,8 @@ BypassIPS:
   - "2405:8100::/32"
   - "2a06:98c0::/29"
   - "2c0f:f248::/32"
-# - "YOUR_PUBLIC_IP/32" # optional
 
-# Storage directory for block data (persistent state)
 StorageDir: "/opt/tblocker"
-
 SendWebhook: true
 WebhookURL: "https://api.telegram.org/bot${bot_token}/sendMessage"
 WebhookTemplate: '{"chat_id":"'"${chat_id}"'","parse_mode":"HTML","text":"🚨 <b>Torrent Detected!</b>\n\n👤 <b>User:</b> %s\n🌍 <b>IP:</b> %s\n🖥 <b>Server:</b> %s\n⚡️ <b>Action:</b> %s\n⏱️ <b>Duration:</b> %d minutes\n🕒 <b>Time:</b> %s"}'
@@ -118,172 +114,73 @@ EOF
 }
 
 merge_snippet() {
-  # Merge snippet into existing config keeping other keys intact.
-  # Uses yq eval-all: original * snippet (snippet overrides keys present)
-  yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' "$CONFIG" "$SNIPPET" > "$MERGED"
+  /usr/local/bin/yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' "$CONFIG" "$SNIPPET" > "$MERGED"
 }
 
 validate_merged() {
-  if [[ ! -s "$MERGED" ]]; then
-    err "Merged file is empty or invalid."
-    return 1
-  fi
-  # optional: try to parse merged with yq to ensure valid YAML
-  if ! yq eval '.' "$MERGED" >/dev/null 2>&1; then
-    err "Merged YAML failed to parse with yq."
-    return 1
-  fi
-  return 0
+  [[ -s "$MERGED" ]] || { err "Merged file is empty."; return 1; }
+  /usr/local/bin/yq eval '.' "$MERGED" >/dev/null || { err "Merged YAML invalid."; return 1; }
 }
 
 install_merged() {
-  # replace original with merged and preserve ownership/permissions from backup (best-effort)
   local backup="$1"
   cp "$MERGED" "$CONFIG"
-  if [[ -f "$backup" ]]; then
-    chmod --reference="$backup" "$CONFIG" || true
-    chown --reference="$backup" "$CONFIG" || true
-  fi
-  log "Config successfully written to $CONFIG"
+  [[ -f "$backup" ]] && { chmod --reference="$backup" "$CONFIG" || true; chown --reference="$backup" "$CONFIG" || true; }
+  log "Config updated: $CONFIG"
 }
 
 restart_service() {
-  log "Attempting to restart $SERVICE_NAME service..."
+  log "Restarting $SERVICE_NAME..."
   if safe_sudo systemctl restart "$SERVICE_NAME" 2>/dev/null; then
-    log "systemctl restart $SERVICE_NAME OK"
-    return 0
+    log "$SERVICE_NAME restarted."
+  else
+    log "Restart failed, trying start..."
+    safe_sudo systemctl start "$SERVICE_NAME" || err "Service could not be started."
   fi
-
-  log "Restart failed; trying start fallback..."
-  if safe_sudo systemctl start "$SERVICE_NAME" 2>/dev/null; then
-    log "systemctl start $SERVICE_NAME OK"
-    return 0
-  fi
-
-  err "Could not restart or start $SERVICE_NAME via systemctl. The service may not exist or systemd may be unavailable."
-  return 1
 }
 
 prompt_token_chatid() {
-  local bot token chat
-  read -rp "Enter Telegram bot token (format 123456:ABC-...): " bot
-  read -rp "Enter Telegram chat id (numeric or @channel): " chat
-  # Basic non-empty check:
-  if [[ -z "$bot" || -z "$chat" ]]; then
-    err "Bot token and chat id are required."
-    return 1
-  fi
+  local bot chat
+  read -rp "Enter Telegram bot token: " bot
+  read -rp "Enter Telegram chat id: " chat
+  [[ -z "$bot" || -z "$chat" ]] && { err "Both required."; return 1; }
   printf '%s\n%s\n' "$bot" "$chat"
 }
 
+# ---------- Menu actions ----------
 menu_update_config() {
-  require_yq || return 1
-  ensure_config_exists || return 1
-
-  # Prompt and get values
+  require_config
   local bot chat
-  if ! read -r bot chat < <(prompt_token_chatid); then
-    return 1
-  fi
-
+  if ! read -r bot chat < <(prompt_token_chatid); then return 1; fi
   create_backup
   build_snippet "$bot" "$chat"
   merge_snippet
-
-  if ! validate_merged; then
-    # restore from backup just in case
-    cp -a "$BACKUP_PATH" "$CONFIG" || true
-    err "Merge validation failed; backup restored. Aborting."
-    return 1
-  fi
-
+  validate_merged || { cp -a "$BACKUP_PATH" "$CONFIG"; return 1; }
   install_merged "$BACKUP_PATH"
-
-  # Ask whether to restart
-  read -rp "Do you want to restart the $SERVICE_NAME service now? [Y/n]: " yn
-  yn="${yn:-Y}"
-  if [[ "$yn" =~ ^([yY]) ]]; then
-    restart_service || err "Service restart failed. Check logs."
-  else
-    log "Skipped restart. Use 'tblock' -> Restart service or run: sudo systemctl restart $SERVICE_NAME"
-  fi
-  return 0
+  read -rp "Restart $SERVICE_NAME now? [Y/n]: " yn
+  [[ "${yn:-Y}" =~ ^[Yy]$ ]] && restart_service
 }
 
-menu_manual_restart() {
-  read -rp "Run 'sudo systemctl restart $SERVICE_NAME' now? [Y/n]: " yn
-  yn="${yn:-Y}"
-  if [[ "$yn" =~ ^([yY]) ]]; then
-    restart_service || err "Service restart failed."
-  else
-    log "Manual restart canceled."
-  fi
-}
+menu_manual_restart() { restart_service; }
+menu_manual_edit() { safe_sudo nano "$CONFIG"; }
+menu_tail_access_log() { [[ -f "$ACCESS_LOG" ]] && tail -f "$ACCESS_LOG" || err "Log not found."; }
+menu_journalctl_follow() { safe_sudo journalctl -u "$SERVICE_NAME" -f; }
+menu_install_global() { safe_sudo cp -a "$(readlink -f "${BASH_SOURCE[0]}")" "$INSTALL_PATH"; safe_sudo chmod +x "$INSTALL_PATH"; log "Installed as $INSTALL_PATH"; }
 
-menu_manual_edit() {
-  ensure_config_exists || return 1
-  log "Opening $CONFIG in nano. Save and exit to return to menu."
-  safe_sudo nano "$CONFIG"
-  log "Done editing."
-}
-
-menu_tail_access_log() {
-  if [[ ! -f "$ACCESS_LOG" ]]; then
-    err "Access log not found at $ACCESS_LOG"
-    return 1
-  fi
-  log "Tailing access log: $ACCESS_LOG (Ctrl-C to stop)"
-  tail -f "$ACCESS_LOG"
-}
-
-menu_journalctl_follow() {
-  log "Following journalctl for unit: $SERVICE_NAME (Ctrl-C to stop)"
-  safe_sudo journalctl -u "$SERVICE_NAME" -f
-}
-
-menu_install_global() {
-  # install this script to /usr/local/bin/tblock (copy)
-  local me
-  me="$(readlink -f "${BASH_SOURCE[0]}")"
-  if [[ ! -f "$me" ]]; then
-    err "Cannot locate current script file."
-    return 1
-  fi
-
-  log "Installing global command to $INSTALL_PATH (requires sudo/root)..."
-  safe_sudo cp -a "$me" "$INSTALL_PATH"
-  safe_sudo chmod +x "$INSTALL_PATH"
-  log "Installed. You can now run the menu with: tblock"
-}
-
-menu_print_help() {
-  cat <<EOF
-tblock - interactive helper for /opt/tblocker/config.yaml
-
-Options:
-  1) Update config (replace BypassIPS + StorageDir + webhook)
-  2) Manual restart tblocker service
-  3) Edit config manually (nano /opt/tblocker/config.yaml)
-  4) Tail access log: tail -f $ACCESS_LOG
-  5) Follow service logs: sudo journalctl -u $SERVICE_NAME -f
-  6) Install this script as global command 'tblock' (copies script to $INSTALL_PATH)
-  7) Exit
-EOF
-}
-
+# ---------- Menu ----------
 main_menu() {
   while true; do
     echo
     echo "================ tblock menu ================"
     echo "1) Update config (BypassIPS + webhook)"
-    echo "2) Manual restart tblocker service"
-    echo "3) Open /opt/tblocker/config.yaml in nano (manual edit)"
-    echo "4) tail -f $ACCESS_LOG"
-    echo "5) sudo journalctl -u $SERVICE_NAME -f"
-    echo "6) Install this script as global command 'tblock'"
+    echo "2) Manual restart $SERVICE_NAME"
+    echo "3) Edit config manually (nano)"
+    echo "4) Tail $ACCESS_LOG"
+    echo "5) journalctl -u $SERVICE_NAME -f"
+    echo "6) Install globally as 'tblock'"
     echo "7) Exit"
     echo "============================================="
-    read -rp "Choose an option [1-7]: " opt
+    read -rp "Choose [1-7]: " opt
     case "$opt" in
       1) menu_update_config ;;
       2) menu_manual_restart ;;
@@ -292,17 +189,13 @@ main_menu() {
       5) menu_journalctl_follow ;;
       6) menu_install_global ;;
       7) log "Bye."; break ;;
-      *) echo "Invalid choice. Pick 1..7." ;;
+      *) echo "Invalid choice." ;;
     esac
   done
 }
 
-# If invoked with "install" arg, just install globally and exit
-if [[ "${1:-}" == "install" ]]; then
-  menu_install_global
-  exit $?
-fi
-
-# Start: check yq but do not abort if missing until needed (we will check before update)
+# ---------- Main ----------
+install_requirements
+require_config
 log "Starting tblock helper..."
 main_menu
