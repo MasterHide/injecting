@@ -109,7 +109,8 @@ BypassIPS:
 StorageDir: "/opt/tblocker"
 SendWebhook: true
 WebhookURL: "https://api.telegram.org/bot${bot_token}/sendMessage"
-WebhookTemplate: '{"chat_id":"'"${chat_id}"'","parse_mode":"HTML","text":"🚨 <b>Torrent Detected!</b>\n\n👤 <b>User:</b> %s\n🌍 <b>IP:</b> %s\n🖥 <b>Server:</b> %s\n⚡️ <b>Action:</b> %s\n⏱️ <b>Duration:</b> %d minutes\n🕒 <b>Time:</b> %s"}'
+WebhookTemplate: |
+  {"chat_id":"${chat_id}","parse_mode":"HTML","text":"🚨 <b>Torrent Detected!</b>\n\n👤 <b>User:</b> %s\n🌍 <b>IP:</b> %s\n🖥 <b>Server:</b> %s\n⚡️ <b>Action:</b> %s\n⏱️ <b>Duration:</b> %d minutes\n🕒 <b>Time:</b> %s"}
 EOF
 }
 
