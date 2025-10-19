@@ -74,10 +74,10 @@ require_config() {
 
   # Seed defaults for the core top-level keys if missing
   /usr/local/bin/yq -i '
-    .LogFile //= "/usr/local/x-ui/access.log" |
-    .BlockDuration //= 10 |
-    .TorrentTag //= "TORRENT" |
-    .BlockMode //= "nft"
+    .LogFile = (.LogFile // "/usr/local/x-ui/access.log") |
+    .BlockDuration = (.BlockDuration // 10) |
+    .TorrentTag = (.TorrentTag // "TORRENT") |
+    .BlockMode = (.BlockMode // "nft")
   ' "$CONFIG"
 }
 
