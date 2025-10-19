@@ -3,7 +3,7 @@
 #
 # Features:
 #  - Installs required packages (yq, nano, curl, wget, systemd utils) if missing
-#  - Ensures config and directories exist
+#  - Ensures config and directories exist; seeds defaults for core keys if absent
 #  - Update BypassIPS + StorageDir + webhook (token/chat) safely (with backup)
 #  - Manual restart / manual edit options
 #  - Log viewing (tail + journalctl)
@@ -35,11 +35,13 @@ safe_sudo() { if is_root; then "$@"; else sudo "$@"; fi; }
 # ---------- Dependency check ----------
 install_requirements() {
   log "Checking and installing required packages..."
+  # Base tools
   if ! command -v curl >/dev/null 2>&1; then safe_sudo apt-get update -y && safe_sudo apt-get install -y curl; fi
   if ! command -v wget >/dev/null 2>&1; then safe_sudo apt-get install -y wget; fi
   if ! command -v nano >/dev/null 2>&1; then safe_sudo apt-get install -y nano; fi
   if ! command -v systemctl >/dev/null 2>&1; then safe_sudo apt-get install -y systemd; fi
 
+  # yq (mikefarah v4) from GitHub to avoid distro variants
   if ! command -v /usr/local/bin/yq >/dev/null 2>&1; then
     log "Installing yq (mikefarah v4)..."
     ARCH=$(uname -m)
@@ -62,10 +64,21 @@ require_config() {
     safe_sudo mkdir -p "$(dirname "$CONFIG")"
   fi
   if [[ ! -f "$CONFIG" ]]; then
-    log "Config file not found, creating empty $CONFIG..."
-    safe_sudo touch "$CONFIG"
+    log "Config file not found, creating $CONFIG..."
+    safe_sudo bash -c "echo '{}' > '$CONFIG'"
     safe_sudo chmod 644 "$CONFIG"
+  elif [[ ! -s "$CONFIG" ]]; then
+    log "Config file exists but is empty; initializing..."
+    safe_sudo bash -c "echo '{}' > '$CONFIG'"
   fi
+
+  # Seed defaults for the core top-level keys if missing
+  /usr/local/bin/yq -i '
+    .LogFile //= "/usr/local/x-ui/access.log" |
+    .BlockDuration //= 10 |
+    .TorrentTag //= "TORRENT" |
+    .BlockMode //= "nft"
+  ' "$CONFIG"
 }
 
 create_backup() {
@@ -110,7 +123,7 @@ StorageDir: "/opt/tblocker"
 SendWebhook: true
 WebhookURL: "https://api.telegram.org/bot${bot_token}/sendMessage"
 WebhookTemplate: |
-  {"chat_id":"${chat_id}","parse_mode":"HTML","text":"🚨 <b>Torrent Detected!</b>\n\n👤 <b>User:</b> %s\n🌍 <b>IP:</b> %s\n🖥 <b>Server:</b> %s\n⚡️ <b>Action:</b> %s\n⏱️ <b>Duration:</b> %d minutes\n🕒 <b>Time:</b> %s"}
+  {"chat_id":"${chat_id}","parse_mode":"HTML","text":"🚨 <b>Torrent Detected!</b>\n\n👤 <b>User:</b> %s\n🌍 <b>IP:</b> %s\n🖥 <b>Server:</b> %s\n⚡ <b>Action:</b> %s\n⏱️ <b>Duration:</b> %d minutes\n🕒 <b>Time:</b> %s"}
 EOF
 }
 
@@ -143,7 +156,10 @@ restart_service() {
 prompt_token_chatid() {
   local bot chat
   read -rp "Enter Telegram bot token: " bot
-  read -rp "Enter Telegram chat id: " chat
+  read -rp "Enter Telegram chat id (numeric or @channel): " chat
+  # trim whitespace just in case
+  bot="${bot//[[:space:]]/}"
+  chat="${chat//[[:space:]]/}"
   [[ -z "$bot" || -z "$chat" ]] && { err "Both required."; return 1; }
   printf '%s\n%s\n' "$bot" "$chat"
 }
@@ -151,22 +167,37 @@ prompt_token_chatid() {
 # ---------- Menu actions ----------
 menu_update_config() {
   require_config
+
   local bot chat
   if ! read -r bot chat < <(prompt_token_chatid); then return 1; fi
+
   create_backup
-  # Remove old doc-comment lines about "additional parameters"
+
+  # Remove the two doc-comment lines you wanted gone
   safe_sudo sed -i '/^# For additional parameters/d;/^# Для дополнительных параметров/d' "$CONFIG"
+
   build_snippet "$bot" "$chat"
   merge_snippet
-  validate_merged || { cp -a "$BACKUP_PATH" "$CONFIG"; return 1; }
+  validate_merged || { cp -a "$BACKUP_PATH" "$CONFIG"; err "Validation failed; backup restored."; return 1; }
+
+  # EXTRA SAFETY: ensure chat_id is not empty in merged template
+  merged_tpl="$(/usr/local/bin/yq -r '.WebhookTemplate' "$MERGED" 2>/dev/null || true)"
+  chat_in_merged="$(printf '%s\n' "$merged_tpl" | sed -n 's/.*"chat_id":"\([^"]*\)".*/\1/p')"
+  if [[ -z "$chat_in_merged" ]]; then
+    err "chat_id is empty in merged config. Aborting & restoring backup."
+    cp -a "$BACKUP_PATH" "$CONFIG"
+    return 1
+  fi
+
   install_merged "$BACKUP_PATH"
+
   read -rp "Restart $SERVICE_NAME now? [Y/n]: " yn
   [[ "${yn:-Y}" =~ ^[Yy]$ ]] && restart_service
 }
 
 menu_manual_restart() { restart_service; }
 menu_manual_edit() { safe_sudo nano "$CONFIG"; }
-menu_tail_access_log() { [[ -f "$ACCESS_LOG" ]] && tail -f "$ACCESS_LOG" || err "Log not found."; }
+menu_tail_access_log() { [[ -f "$ACCESS_LOG" ]] && tail -f "$ACCESS_LOG" || err "Log not found: $ACCESS_LOG"; }
 menu_journalctl_follow() { safe_sudo journalctl -u "$SERVICE_NAME" -f; }
 menu_install_global() { safe_sudo cp -a "$(readlink -f "${BASH_SOURCE[0]}")" "$INSTALL_PATH"; safe_sudo chmod +x "$INSTALL_PATH"; log "Installed as $INSTALL_PATH"; }
 
