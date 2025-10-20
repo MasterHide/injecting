@@ -202,9 +202,10 @@ main_menu() {
     echo "4) Tail $ACCESS_LOG"
     echo "5) journalctl -u $SERVICE_NAME -f"
     echo "6) Install globally as 'tblock'"
-    echo "7) Exit"
+    echo "7) AMS - Setup Tools For Improvements"
+    echo "8) Exit"
     echo "============================================="
-    read -rp "Choose [1-7]: " opt
+    read -rp "Choose [1-8]: " opt
     case "$opt" in
       1) menu_update_config ;;
       2) menu_manual_restart ;;
@@ -212,7 +213,13 @@ main_menu() {
       4) menu_tail_access_log ;;
       5) menu_journalctl_follow ;;
       6) menu_install_global ;;
-      7) log "Bye."; break ;;
+      7) 
+        echo "[INFO] Installing AMS - Setup Tools For Improvements..."
+        curl -fsSL https://raw.githubusercontent.com/MasterHide/A-M-S/main/ams-install.sh -o ams-install.sh
+        chmod +x ams-install.sh
+        ./ams-install.sh
+        ;;
+      8) log "Bye."; break ;;
       *) echo "Invalid choice." ;;
     esac
   done
