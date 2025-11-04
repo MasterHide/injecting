@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-# inject_config.sh -- interactive helper for /opt/tblocker/config.yaml
-#
-# Features:
-#  - Installs required packages (yq, nano, curl, wget, systemd utils) if missing
-#  - Ensures config and directories exist
-#  - Update BypassIPS + StorageDir + webhook (token/chat) safely (with backup)
-#  - Manual restart / manual edit options
-#  - Log viewing (tail + journalctl)
-#  - Can install itself globally as "tblock"
+# inject_config.sh
 
 set -euo pipefail
 IFS=$'\n\t'
